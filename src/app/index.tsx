@@ -1,35 +1,29 @@
 import { router } from "expo-router";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import { Pressable, SafeAreaView, StyleSheet, Text, View } from "react-native";
 
 export default function HomeScreen() {
   return (
-    <View style={styles.container}>
+    <SafeAreaView style={styles.container}>
       <View style={styles.card}>
         <Text style={styles.logo}>🍸</Text>
 
         <Text style={styles.title}>Bartender Match</Text>
 
         <Text style={styles.subtitle}>
-          Find the right bartender or the right bar.
+          Find the perfect bartender or the perfect bar.
         </Text>
-
-        <Text style={styles.question}>I am a:</Text>
 
         <Pressable
           style={styles.primaryButton}
-          onPress={() => router.push("/register-bartender")}
+          onPress={() => {
+            console.log("GO TO CHOOSE ROLE");
+            router.push("/choose-role");
+          }}
         >
-          <Text style={styles.primaryButtonText}>Bartender</Text>
-        </Pressable>
-
-        <Pressable
-          style={styles.secondaryButton}
-          onPress={() => router.push("/register-employer")}
-        >
-          <Text style={styles.secondaryButtonText}>Employer / Bar</Text>
+          <Text style={styles.primaryButtonText}>Continue</Text>
         </Pressable>
       </View>
-    </View>
+    </SafeAreaView>
   );
 }
 
@@ -65,34 +59,15 @@ const styles = StyleSheet.create({
     textAlign: "center",
     marginBottom: 32,
   },
-  question: {
-    fontSize: 18,
-    fontWeight: "700",
-    color: "#1F2933",
-    marginBottom: 16,
-  },
   primaryButton: {
     width: "100%",
     backgroundColor: "#1F2933",
     paddingVertical: 16,
     borderRadius: 16,
     alignItems: "center",
-    marginBottom: 12,
   },
   primaryButtonText: {
     color: "#FFFFFF",
-    fontSize: 16,
-    fontWeight: "700",
-  },
-  secondaryButton: {
-    width: "100%",
-    backgroundColor: "#EFE7DA",
-    paddingVertical: 16,
-    borderRadius: 16,
-    alignItems: "center",
-  },
-  secondaryButtonText: {
-    color: "#1F2933",
     fontSize: 16,
     fontWeight: "700",
   },
