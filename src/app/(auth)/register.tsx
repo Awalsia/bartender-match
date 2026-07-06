@@ -1,4 +1,5 @@
 import { supabase } from "@/lib/supabase";
+import { router, useLocalSearchParams } from "expo-router";
 import { useState } from "react";
 import {
   ActivityIndicator,
@@ -9,7 +10,15 @@ import {
   View,
 } from "react-native";
 
-export default function RegisterBartenderScreen() {
+export default function RegisterScreen() {
+  const { role } = useLocalSearchParams<{ role: string }>();
+
+  const selectedRole = role === "employer" ? "employer" : "bartender";
+  const title =
+    selectedRole === "employer"
+      ? "Create employer account"
+      : "Create bartender account";
+
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
 
@@ -31,7 +40,7 @@ export default function RegisterBartenderScreen() {
       password,
       options: {
         data: {
-          role: "bartender",
+          role: selectedRole,
         },
       },
     });
@@ -50,7 +59,7 @@ export default function RegisterBartenderScreen() {
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>Create bartender account</Text>
+      <Text style={styles.title}>{title}</Text>
 
       <TextInput
         style={styles.input}
@@ -75,10 +84,16 @@ export default function RegisterBartenderScreen() {
         disabled={loading}
       >
         {loading ? (
-          <ActivityIndicator />
+          <ActivityIndicator color="#FFFFFF" />
         ) : (
           <Text style={styles.buttonText}>Create account</Text>
         )}
+      </Pressable>
+
+      <Pressable
+        onPress={() => router.push(`/(auth)/login?role=${selectedRole}`)}
+      >
+        <Text style={styles.link}>Already have an account? Login</Text>
       </Pressable>
 
       {message ? <Text style={styles.message}>{message}</Text> : null}
@@ -123,6 +138,13 @@ const styles = StyleSheet.create({
     color: "#FFFFFF",
     fontWeight: "700",
     fontSize: 16,
+  },
+  link: {
+    marginTop: 18,
+    textAlign: "center",
+    color: "#1F2933",
+    textDecorationLine: "underline",
+    fontWeight: "600",
   },
   message: {
     marginTop: 18,
