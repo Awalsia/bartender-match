@@ -39,6 +39,7 @@ export default function RegisterScreen() {
       email: email.trim(),
       password,
       options: {
+        emailRedirectTo: "http://localhost:8081/email-confirmed",
         data: {
           role: selectedRole,
         },
