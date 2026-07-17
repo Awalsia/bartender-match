@@ -4,17 +4,17 @@ import { router } from "expo-router";
 import { useEffect, useState } from "react";
 import { ActivityIndicator, StyleSheet, View } from "react-native";
 
-export default function BartenderManagePhotosPage() {
+export default function BartenderManageMediaPage() {
   const [profileId, setProfileId] = useState<string | null>(null);
 
   useEffect(() => {
-    loadProfileId();
+    void loadProfileId();
   }, []);
 
   async function loadProfileId() {
-    const { data: userData } = await supabase.auth.getUser();
+    const { data: userData, error: userError } = await supabase.auth.getUser();
 
-    if (!userData.user) {
+    if (userError || !userData.user) {
       router.replace("/(auth)/login");
       return;
     }
@@ -23,7 +23,7 @@ export default function BartenderManagePhotosPage() {
       .from("bartender_profiles")
       .select("id")
       .eq("user_id", userData.user.id)
-      .single();
+      .maybeSingle();
 
     if (error || !data) {
       router.replace("/(bartender)/complete-profile");

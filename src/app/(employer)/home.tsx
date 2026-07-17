@@ -1,10 +1,9 @@
 import CoverPhoto from "@/components/profile/CoverPhoto";
 import { supabase } from "@/lib/supabase";
 import { router, useFocusEffect } from "expo-router";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
-  Alert,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -29,18 +28,57 @@ type MatchIdRow = {
 
 export default function EmployerHomeScreen() {
   const [profile, setProfile] = useState<EmployerProfile | null>(null);
+  const [authenticatedUserId, setAuthenticatedUserId] = useState<string | null>(
+    null,
+  );
 
   const [unreadMessagesCount, setUnreadMessagesCount] = useState(0);
-
   const [unseenMatchesCount, setUnseenMatchesCount] = useState(0);
+  const [unreadNotificationsCount, setUnreadNotificationsCount] = useState(0);
 
   const [loading, setLoading] = useState(true);
+
+  const isMountedRef = useRef(true);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   useFocusEffect(
     useCallback(() => {
       void loadHome();
     }, []),
   );
+
+  useEffect(() => {
+    if (!authenticatedUserId) {
+      return;
+    }
+
+    const channel = supabase
+      .channel(`employer-home-notifications-${authenticatedUserId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "notifications",
+          filter: `user_id=eq.${authenticatedUserId}`,
+        },
+        () => {
+          void loadUnreadNotificationsCount(authenticatedUserId);
+        },
+      )
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [authenticatedUserId]);
 
   async function loadHome() {
     setLoading(true);
@@ -54,7 +92,9 @@ export default function EmployerHomeScreen() {
       return;
     }
 
-    const authenticatedUserId = userData.user.id;
+    const userId = userData.user.id;
+
+    setAuthenticatedUserId(userId);
 
     const { data, error } = await supabase
       .from("employer_profiles")
@@ -70,44 +110,56 @@ export default function EmployerHomeScreen() {
         currency
         `,
       )
-      .eq("user_id", authenticatedUserId)
+      .eq("user_id", userId)
       .single();
 
     if (error || !data) {
       console.log("LOAD EMPLOYER PROFILE ERROR:", error);
 
       router.replace("/(employer)/complete-profile");
+      return;
+    }
 
+    if (!isMountedRef.current) {
       return;
     }
 
     setProfile(data as EmployerProfile);
 
     await Promise.all([
-      loadUnreadMessagesCount(authenticatedUserId),
-      loadUnseenMatchesCount(authenticatedUserId),
+      loadUnreadMessagesCount(userId),
+      loadUnseenMatchesCount(userId),
+      loadUnreadNotificationsCount(userId),
     ]);
 
-    setLoading(false);
+    if (isMountedRef.current) {
+      setLoading(false);
+    }
   }
 
-  async function loadUnreadMessagesCount(authenticatedUserId: string) {
+  async function loadUnreadMessagesCount(userId: string) {
     const { data: matchRows, error: matchError } = await supabase
       .from("matches")
       .select("id")
-      .eq("employer_user_id", authenticatedUserId);
+      .eq("employer_user_id", userId);
 
     if (matchError) {
       console.log("LOAD EMPLOYER MATCH IDS ERROR:", matchError);
 
-      setUnreadMessagesCount(0);
+      if (isMountedRef.current) {
+        setUnreadMessagesCount(0);
+      }
+
       return;
     }
 
     const matches = (matchRows ?? []) as MatchIdRow[];
 
     if (matches.length === 0) {
-      setUnreadMessagesCount(0);
+      if (isMountedRef.current) {
+        setUnreadMessagesCount(0);
+      }
+
       return;
     }
 
@@ -120,44 +172,80 @@ export default function EmployerHomeScreen() {
         head: true,
       })
       .in("match_id", matchIds)
-      .neq("sender_id", authenticatedUserId)
+      .neq("sender_id", userId)
       .is("read_at", null);
 
     if (error) {
       console.log("LOAD EMPLOYER UNREAD COUNT ERROR:", error);
 
-      setUnreadMessagesCount(0);
+      if (isMountedRef.current) {
+        setUnreadMessagesCount(0);
+      }
+
       return;
     }
 
-    setUnreadMessagesCount(count ?? 0);
+    if (isMountedRef.current) {
+      setUnreadMessagesCount(count ?? 0);
+    }
   }
 
-  async function loadUnseenMatchesCount(authenticatedUserId: string) {
+  async function loadUnseenMatchesCount(userId: string) {
     const { count, error } = await supabase
       .from("matches")
       .select("id", {
         count: "exact",
         head: true,
       })
-      .eq("employer_user_id", authenticatedUserId)
+      .eq("employer_user_id", userId)
       .is("employer_seen_at", null);
 
     if (error) {
       console.log("LOAD EMPLOYER UNSEEN MATCHES ERROR:", error);
 
-      setUnseenMatchesCount(0);
+      if (isMountedRef.current) {
+        setUnseenMatchesCount(0);
+      }
+
       return;
     }
 
-    setUnseenMatchesCount(count ?? 0);
+    if (isMountedRef.current) {
+      setUnseenMatchesCount(count ?? 0);
+    }
+  }
+
+  async function loadUnreadNotificationsCount(userId: string) {
+    const { count, error } = await supabase
+      .from("notifications")
+      .select("id", {
+        count: "exact",
+        head: true,
+      })
+      .eq("user_id", userId)
+      .is("read_at", null);
+
+    if (error) {
+      console.log("LOAD EMPLOYER NOTIFICATIONS COUNT ERROR:", error);
+
+      if (isMountedRef.current) {
+        setUnreadNotificationsCount(0);
+      }
+
+      return;
+    }
+
+    if (isMountedRef.current) {
+      setUnreadNotificationsCount(count ?? 0);
+    }
+  }
+
+  function openNotifications() {
+    router.push("/notifications");
   }
 
   function openReferences() {
-    Alert.alert(
-      "References",
-      "The references section will be created in the next step.",
-    );
+    router.push("/(employer)/references");
   }
 
   async function handleLogout() {
@@ -174,15 +262,43 @@ export default function EmployerHomeScreen() {
     );
   }
 
+  const businessName = profile?.business_name || "Business";
+
   return (
     <ScrollView
       style={styles.screen}
       contentContainerStyle={styles.content}
       showsVerticalScrollIndicator={false}
     >
-      <Text style={styles.welcome}>Welcome back,</Text>
+      <View style={styles.topRow}>
+        <View style={styles.welcomeContent}>
+          <Text style={styles.welcome}>Welcome back,</Text>
 
-      <Text style={styles.name}>{profile?.business_name}</Text>
+          <Text style={styles.name}>{businessName}</Text>
+        </View>
+
+        <Pressable
+          style={({ pressed }) => [
+            styles.notificationButton,
+            pressed && styles.notificationButtonPressed,
+          ]}
+          onPress={openNotifications}
+          accessibilityRole="button"
+          accessibilityLabel="Open notifications"
+        >
+          <Text style={styles.notificationIcon}>🔔</Text>
+
+          {unreadNotificationsCount > 0 ? (
+            <View style={styles.notificationBadge}>
+              <Text style={styles.notificationBadgeText}>
+                {unreadNotificationsCount > 99
+                  ? "99+"
+                  : unreadNotificationsCount}
+              </Text>
+            </View>
+          ) : null}
+        </Pressable>
+      </View>
 
       {profile ? <CoverPhoto profileId={profile.id} role="employer" /> : null}
 
@@ -193,7 +309,7 @@ export default function EmployerHomeScreen() {
         ]}
         onPress={() => router.push("/(employer)/manage-photos")}
       >
-        <Text style={styles.primaryButtonText}>Manage photos</Text>
+        <Text style={styles.primaryButtonText}>Manage media</Text>
       </Pressable>
 
       <View style={styles.profileCard}>
@@ -202,7 +318,8 @@ export default function EmployerHomeScreen() {
         <Text style={styles.info}>🍸 {profile?.bar_type || "Not set"}</Text>
 
         <Text style={styles.info}>
-          📍 {profile?.city}, {profile?.country}
+          📍 {profile?.city || "City not specified"}
+          {profile?.country ? `, ${profile.country}` : ""}
         </Text>
 
         <Text style={styles.info}>
@@ -319,27 +436,86 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: "#F7F4EF",
   },
+
   content: {
     padding: 24,
     paddingTop: 70,
     paddingBottom: 44,
   },
+
   loadingContainer: {
     flex: 1,
     backgroundColor: "#F7F4EF",
     alignItems: "center",
     justifyContent: "center",
   },
+
+  topRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    gap: 16,
+    marginBottom: 16,
+  },
+
+  welcomeContent: {
+    flex: 1,
+  },
+
   welcome: {
     fontSize: 18,
     color: "#666666",
   },
+
   name: {
+    marginTop: 2,
     fontSize: 34,
     fontWeight: "800",
     color: "#2C2C2C",
-    marginBottom: 16,
   },
+
+  notificationButton: {
+    width: 52,
+    height: 52,
+    borderRadius: 26,
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: "#E5E0D8",
+    alignItems: "center",
+    justifyContent: "center",
+    position: "relative",
+  },
+
+  notificationButtonPressed: {
+    opacity: 0.82,
+    transform: [{ scale: 0.97 }],
+  },
+
+  notificationIcon: {
+    fontSize: 23,
+  },
+
+  notificationBadge: {
+    position: "absolute",
+    top: -6,
+    right: -6,
+    minWidth: 23,
+    height: 23,
+    borderRadius: 12,
+    paddingHorizontal: 5,
+    backgroundColor: "#B00020",
+    borderWidth: 2,
+    borderColor: "#F7F4EF",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  notificationBadgeText: {
+    color: "#FFFFFF",
+    fontSize: 10,
+    fontWeight: "900",
+  },
+
   primaryButton: {
     backgroundColor: "#2C2C2C",
     paddingVertical: 14,
@@ -349,15 +525,18 @@ const styles = StyleSheet.create({
     marginTop: 18,
     marginBottom: 18,
   },
+
   primaryButtonText: {
     color: "#FFFFFF",
     fontSize: 16,
     fontWeight: "800",
   },
+
   buttonPressed: {
     opacity: 0.88,
     transform: [{ scale: 0.99 }],
   },
+
   profileCard: {
     backgroundColor: "#FFFFFF",
     borderRadius: 20,
@@ -366,23 +545,27 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#E5E0D8",
   },
+
   cardTitle: {
     fontSize: 20,
     fontWeight: "700",
     color: "#2C2C2C",
     marginBottom: 12,
   },
+
   info: {
     fontSize: 16,
     color: "#444444",
     marginBottom: 8,
   },
+
   bio: {
     fontSize: 15,
     color: "#666666",
     marginTop: 12,
     lineHeight: 22,
   },
+
   navigationCard: {
     backgroundColor: "#FFFFFF",
     borderRadius: 20,
@@ -393,10 +576,12 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
   },
+
   navigationCardPressed: {
     opacity: 0.88,
     transform: [{ scale: 0.99 }],
   },
+
   navigationIcon: {
     width: 52,
     height: 52,
@@ -407,9 +592,11 @@ const styles = StyleSheet.create({
     marginRight: 14,
     position: "relative",
   },
+
   navigationEmoji: {
     fontSize: 24,
   },
+
   navigationBadge: {
     position: "absolute",
     right: -6,
@@ -424,23 +611,29 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
+
   navigationBadgeText: {
     color: "#FFFFFF",
     fontSize: 10,
     fontWeight: "900",
   },
+
   navigationContent: {
     flex: 1,
   },
+
   navigationTitleRow: {
     flexDirection: "row",
     alignItems: "center",
+    flexWrap: "wrap",
   },
+
   navigationTitle: {
     fontSize: 19,
     fontWeight: "800",
     color: "#2C2C2C",
   },
+
   inlineBadge: {
     minWidth: 23,
     height: 23,
@@ -451,26 +644,31 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
+
   inlineBadgeText: {
     color: "#FFFFFF",
     fontSize: 11,
     fontWeight: "900",
   },
+
   navigationDescription: {
     fontSize: 14,
     lineHeight: 20,
     color: "#666666",
     marginTop: 5,
   },
+
   navigationLink: {
     marginTop: 8,
     color: "#2C2C2C",
     fontWeight: "800",
   },
+
   logoutButton: {
     marginTop: 10,
     alignItems: "center",
   },
+
   logoutText: {
     color: "#B00020",
     textDecorationLine: "underline",

@@ -1,11 +1,46 @@
 {
   "expo": {
-    "name": "bartender-match",
+    "name": "Bartinder",
     "slug": "bartender-match",
     "scheme": "bartender-match",
-    "plugins": ["expo-router"],
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.bartinder.app"
+    },
+    "android": {
+      "package": "com.bartinder.app",
+      "googleServicesFile": "./google-services.json",
+      "adaptiveIcon": {
+        "backgroundColor": "#F7F4EF"
+      }
+    },
+    "plugins": [
+      "expo-router",
+      "expo-video",
+      [
+        "expo-notifications",
+        {
+          "defaultChannel": "default",
+          "sounds": []
+        }
+      ],
+      "expo-image",
+      "expo-splash-screen",
+      "expo-status-bar",
+      "expo-web-browser"
+    ],
     "experiments": {
       "typedRoutes": true
-    }
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "ec465bef-1bde-4437-830e-30d6c4cde687"
+      }
+    },
+    "owner": "stefab"
   }
 }
