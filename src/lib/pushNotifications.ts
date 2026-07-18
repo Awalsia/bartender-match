@@ -12,21 +12,27 @@ export type PushRegistrationResult =
   | {
       status:
         | "not_authenticated"
-        | "not_physical_device"
         | "permission_denied"
         | "missing_project_id"
         | "registration_failed";
       message: string;
     };
 
-function getEasProjectId() {
+export type NotificationNavigationData = {
+  type?: string;
+  matchId?: string;
+  name?: string;
+  photoUrl?: string;
+};
+
+function getEasProjectId(): string | null {
   const projectId =
-    Constants.easConfig?.projectId ??
-    Constants.expoConfig?.extra?.eas?.projectId;
+    Constants.expoConfig?.extra?.eas?.projectId ??
+    Constants.easConfig?.projectId;
 
   if (
     typeof projectId !== "string" ||
-    !projectId ||
+    projectId.trim().length === 0 ||
     projectId === "REPLACE_WITH_YOUR_EAS_PROJECT_ID"
   ) {
     return null;
@@ -35,72 +41,100 @@ function getEasProjectId() {
   return projectId;
 }
 
-async function configureAndroidChannel() {
+async function configureAndroidNotificationChannel(): Promise<void> {
   if (Platform.OS !== "android") {
     return;
   }
 
   await Notifications.setNotificationChannelAsync("default", {
     name: "Bartinder notifications",
+    description: "Messages, matches and account notifications",
     importance: Notifications.AndroidImportance.MAX,
     vibrationPattern: [0, 250, 250, 250],
     lightColor: "#B00020",
-    lockscreenVisibility:
-      Notifications.AndroidNotificationVisibility.PUBLIC,
+    sound: "default",
+    enableVibrate: true,
+    enableLights: true,
+    lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
   });
+}
+
+async function requestNotificationPermission(): Promise<boolean> {
+  const currentPermissions = await Notifications.getPermissionsAsync();
+
+  if (currentPermissions.status === "granted") {
+    return true;
+  }
+
+  const requestedPermissions = await Notifications.requestPermissionsAsync();
+
+  return requestedPermissions.status === "granted";
 }
 
 export async function registerForPushNotificationsAsync(): Promise<PushRegistrationResult> {
   try {
+    console.log("PUSH: Starting push notification registration...");
+
     const {
       data: { user },
       error: userError,
     } = await supabase.auth.getUser();
 
-    if (userError || !user) {
+    if (userError) {
+      console.log("PUSH: Could not read authenticated user:", userError);
+
+      return {
+        status: "not_authenticated",
+        message: userError.message,
+      };
+    }
+
+    if (!user) {
+      console.log("PUSH: Registration skipped because no user is logged in.");
+
       return {
         status: "not_authenticated",
         message: "The user is not authenticated.",
       };
     }
 
-    if (!Device.isDevice) {
-      return {
-        status: "not_physical_device",
-        message:
-          "Remote push notifications must be tested on a physical device.",
-      };
-    }
+    console.log("PUSH: Authenticated user:", user.id);
+    console.log("PUSH: Device.isDevice:", Device.isDevice);
+    console.log("PUSH: Platform:", Platform.OS);
 
-    await configureAndroidChannel();
+    /*
+     * This must run before obtaining the push token on Android.
+     * Android emulators with Google Play Services are supported,
+     * so registration must not be blocked by Device.isDevice.
+     */
+    await configureAndroidNotificationChannel();
 
-    const currentPermissions = await Notifications.getPermissionsAsync();
+    const permissionGranted = await requestNotificationPermission();
 
-    let finalStatus = currentPermissions.status;
+    if (!permissionGranted) {
+      console.log("PUSH: Notification permission was denied.");
 
-    if (finalStatus !== "granted") {
-      const requestedPermissions =
-        await Notifications.requestPermissionsAsync();
-
-      finalStatus = requestedPermissions.status;
-    }
-
-    if (finalStatus !== "granted") {
       return {
         status: "permission_denied",
         message: "Notification permission was not granted.",
       };
     }
 
+    console.log("PUSH: Notification permission granted.");
+
     const projectId = getEasProjectId();
 
     if (!projectId) {
+      console.log("PUSH: EAS project ID is missing.");
+
       return {
         status: "missing_project_id",
-        message:
-          "The EAS project ID is missing. Run eas init and place the project ID in app.json.",
+        message: "The EAS project ID is missing from the Expo configuration.",
       };
     }
+
+    console.log("PUSH: EAS project ID:", projectId);
+    console.log("PUSH: Requesting Expo push token...");
 
     const tokenResponse = await Notifications.getExpoPushTokenAsync({
       projectId,
@@ -108,13 +142,25 @@ export async function registerForPushNotificationsAsync(): Promise<PushRegistrat
 
     const expoPushToken = tokenResponse.data;
 
+    if (!expoPushToken) {
+      return {
+        status: "registration_failed",
+        message: "Expo returned an empty push token.",
+      };
+    }
+
+    console.log("PUSH: Expo push token generated:", expoPushToken);
+    console.log("PUSH: Saving token in Supabase...");
+
     const { error: upsertError } = await supabase.from("push_tokens").upsert(
       {
         user_id: user.id,
         expo_push_token: expoPushToken,
         platform: Platform.OS,
-        device_name: Device.deviceName ?? null,
-        app_version: Constants.expoConfig?.version ?? null,
+        device_name:
+          Device.deviceName ?? `${Platform.OS} ${Device.modelName ?? "device"}`,
+        app_version:
+          Constants.expoConfig?.version ?? Constants.nativeAppVersion ?? null,
         is_active: true,
         last_seen_at: new Date().toISOString(),
       },
@@ -124,7 +170,7 @@ export async function registerForPushNotificationsAsync(): Promise<PushRegistrat
     );
 
     if (upsertError) {
-      console.log("SAVE PUSH TOKEN ERROR:", upsertError);
+      console.log("PUSH: Supabase token save error:", upsertError);
 
       return {
         status: "registration_failed",
@@ -132,28 +178,34 @@ export async function registerForPushNotificationsAsync(): Promise<PushRegistrat
       };
     }
 
+    console.log("PUSH: Token saved successfully in push_tokens.");
+
     return {
       status: "registered",
       token: expoPushToken,
     };
   } catch (error) {
-    console.log("REGISTER PUSH NOTIFICATIONS ERROR:", error);
+    console.log("PUSH: Unexpected registration error:", error);
 
     return {
       status: "registration_failed",
       message:
         error instanceof Error
           ? error.message
-          : "Push registration failed.",
+          : "Push notification registration failed.",
     };
   }
 }
 
-export async function deactivateCurrentDevicePushToken() {
+export async function deactivateCurrentDevicePushToken(): Promise<void> {
   try {
     const projectId = getEasProjectId();
 
-    if (!projectId || !Device.isDevice) {
+    if (!projectId) {
+      console.log(
+        "PUSH: Token deactivation skipped because project ID is missing.",
+      );
+
       return;
     }
 
@@ -161,20 +213,54 @@ export async function deactivateCurrentDevicePushToken() {
       projectId,
     });
 
-    await supabase
+    const expoPushToken = tokenResponse.data;
+
+    const { error } = await supabase
       .from("push_tokens")
       .update({
         is_active: false,
         last_seen_at: new Date().toISOString(),
       })
-      .eq("expo_push_token", tokenResponse.data);
+      .eq("expo_push_token", expoPushToken);
+
+    if (error) {
+      console.log("PUSH: Token deactivation error:", error);
+      return;
+    }
+
+    console.log("PUSH: Current device token deactivated.");
   } catch (error) {
-    console.log("DEACTIVATE PUSH TOKEN ERROR:", error);
+    console.log("PUSH: Unexpected token deactivation error:", error);
   }
 }
 
 export function getNotificationNavigationData(
   response: Notifications.NotificationResponse,
-) {
-  return response.notification.request.content.data;
+): NotificationNavigationData {
+  const rawData = response.notification.request.content.data;
+
+  const type = typeof rawData?.type === "string" ? rawData.type : undefined;
+
+  const matchId =
+    typeof rawData?.match_id === "string"
+      ? rawData.match_id
+      : typeof rawData?.matchId === "string"
+        ? rawData.matchId
+        : undefined;
+
+  const name = typeof rawData?.name === "string" ? rawData.name : undefined;
+
+  const photoUrl =
+    typeof rawData?.photo_url === "string"
+      ? rawData.photo_url
+      : typeof rawData?.photoUrl === "string"
+        ? rawData.photoUrl
+        : undefined;
+
+  return {
+    type,
+    matchId,
+    name,
+    photoUrl,
+  };
 }

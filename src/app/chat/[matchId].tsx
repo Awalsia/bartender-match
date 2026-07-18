@@ -1,18 +1,19 @@
+import { isUserOnline, subscribeToOnlineUsers } from "@/lib/presence";
 import { supabase } from "@/lib/supabase";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 import { router, useLocalSearchParams } from "expo-router";
 import { useEffect, useRef, useState } from "react";
 import {
-    ActivityIndicator,
-    FlatList,
-    Image,
-    KeyboardAvoidingView,
-    Platform,
-    Pressable,
-    StyleSheet,
-    Text,
-    TextInput,
-    View,
+  ActivityIndicator,
+  FlatList,
+  Image,
+  KeyboardAvoidingView,
+  Platform,
+  Pressable,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
 } from "react-native";
 
 type MessageRow = {
@@ -28,6 +29,11 @@ type MatchRow = {
   id: string;
   bartender_user_id: string;
   employer_user_id: string;
+};
+
+type ProfilePresenceRow = {
+  id: string;
+  last_seen_at: string | null;
 };
 
 type RouteParams = {
@@ -52,21 +58,34 @@ export default function ChatScreen() {
     : params.photoUrl;
 
   const contactName = nameParameter?.trim() || "Your match";
-
   const contactPhotoUrl = photoParameter?.trim() || null;
 
   const [currentUserId, setCurrentUserId] = useState<string | null>(null);
+  const [contactUserId, setContactUserId] = useState<string | null>(null);
+  const [contactIsOnline, setContactIsOnline] = useState(false);
+  const [contactLastSeenAt, setContactLastSeenAt] = useState<string | null>(
+    null,
+  );
+  const [presenceClock, setPresenceClock] = useState(Date.now());
+  const [contactIsTyping, setContactIsTyping] = useState(false);
 
   const [messages, setMessages] = useState<MessageRow[]>([]);
-
   const [draft, setDraft] = useState("");
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
 
   const listRef = useRef<FlatList<MessageRow>>(null);
-
-  const realtimeChannelRef = useRef<RealtimeChannel | null>(null);
+  const messagesChannelRef = useRef<RealtimeChannel | null>(null);
+  const profileChannelRef = useRef<RealtimeChannel | null>(null);
+  const typingChannelRef = useRef<RealtimeChannel | null>(null);
+  const typingChannelReadyRef = useRef(false);
+  const typingStopTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const incomingTypingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
 
   useEffect(() => {
     if (!matchId) {
@@ -78,13 +97,60 @@ export default function ChatScreen() {
     void initializeChat();
 
     return () => {
-      if (realtimeChannelRef.current) {
-        void supabase.removeChannel(realtimeChannelRef.current);
+      if (messagesChannelRef.current) {
+        void supabase.removeChannel(messagesChannelRef.current);
+        messagesChannelRef.current = null;
+      }
 
-        realtimeChannelRef.current = null;
+      if (typingStopTimeoutRef.current) {
+        clearTimeout(typingStopTimeoutRef.current);
+        typingStopTimeoutRef.current = null;
+      }
+
+      if (incomingTypingTimeoutRef.current) {
+        clearTimeout(incomingTypingTimeoutRef.current);
+        incomingTypingTimeoutRef.current = null;
+      }
+
+      void broadcastTypingStatus(false);
+
+      if (profileChannelRef.current) {
+        void supabase.removeChannel(profileChannelRef.current);
+        profileChannelRef.current = null;
+      }
+
+      if (typingChannelRef.current) {
+        void supabase.removeChannel(typingChannelRef.current);
+        typingChannelRef.current = null;
+        typingChannelReadyRef.current = false;
       }
     };
   }, [matchId]);
+
+  useEffect(() => {
+    if (!contactUserId) {
+      setContactIsOnline(false);
+      return;
+    }
+
+    setContactIsOnline(isUserOnline(contactUserId));
+
+    const unsubscribe = subscribeToOnlineUsers((onlineUserIds) => {
+      setContactIsOnline(onlineUserIds.has(contactUserId));
+    });
+
+    return unsubscribe;
+  }, [contactUserId]);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setPresenceClock(Date.now());
+    }, 30_000);
+
+    return () => {
+      clearInterval(interval);
+    };
+  }, []);
 
   async function initializeChat() {
     if (!matchId) return;
@@ -96,7 +162,6 @@ export default function ChatScreen() {
 
     if (userError || !userData.user) {
       console.log("LOAD CHAT USER ERROR:", userError);
-
       router.replace("/(auth)/login");
       return;
     }
@@ -111,7 +176,6 @@ export default function ChatScreen() {
 
     if (matchError) {
       console.log("LOAD CHAT MATCH ERROR:", matchError);
-
       setErrorMessage(matchError.message);
       setLoading(false);
       return;
@@ -131,15 +195,166 @@ export default function ChatScreen() {
 
     if (!belongsToMatch) {
       setErrorMessage("You do not have permission to open this conversation.");
-
       setLoading(false);
       return;
     }
 
-    setCurrentUserId(authenticatedUserId);
+    const otherUserId =
+      match.bartender_user_id === authenticatedUserId
+        ? match.employer_user_id
+        : match.bartender_user_id;
 
-    await loadMessages(authenticatedUserId);
+    setCurrentUserId(authenticatedUserId);
+    setContactUserId(otherUserId);
+
+    await Promise.all([
+      loadMessages(authenticatedUserId),
+      loadContactPresenceProfile(otherUserId),
+    ]);
+
     subscribeToMessages(authenticatedUserId);
+    subscribeToContactProfile(otherUserId);
+    subscribeToTyping(authenticatedUserId, otherUserId);
+  }
+
+  async function loadContactPresenceProfile(otherUserId: string) {
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("id, last_seen_at")
+      .eq("id", otherUserId)
+      .maybeSingle();
+
+    if (error) {
+      console.log("LOAD CONTACT LAST SEEN ERROR:", error);
+      return;
+    }
+
+    const profile = data as ProfilePresenceRow | null;
+    setContactLastSeenAt(profile?.last_seen_at ?? null);
+  }
+
+  function subscribeToTyping(authenticatedUserId: string, otherUserId: string) {
+    if (!matchId) return;
+
+    if (typingChannelRef.current) {
+      void supabase.removeChannel(typingChannelRef.current);
+    }
+
+    typingChannelReadyRef.current = false;
+
+    const channel = supabase
+      .channel(`chat-typing:${matchId}`)
+      .on("broadcast", { event: "typing" }, ({ payload }) => {
+        const typingUserId =
+          typeof payload?.user_id === "string" ? payload.user_id : null;
+        const isTyping = payload?.is_typing === true;
+
+        if (
+          typingUserId !== otherUserId ||
+          typingUserId === authenticatedUserId
+        ) {
+          return;
+        }
+
+        if (incomingTypingTimeoutRef.current) {
+          clearTimeout(incomingTypingTimeoutRef.current);
+          incomingTypingTimeoutRef.current = null;
+        }
+
+        setContactIsTyping(isTyping);
+
+        if (isTyping) {
+          incomingTypingTimeoutRef.current = setTimeout(() => {
+            setContactIsTyping(false);
+            incomingTypingTimeoutRef.current = null;
+          }, 3000);
+        }
+      })
+      .subscribe((status, error) => {
+        if (error) {
+          console.log("CHAT TYPING SUBSCRIPTION ERROR:", error);
+        }
+
+        typingChannelReadyRef.current = status === "SUBSCRIBED";
+        console.log("CHAT TYPING SUBSCRIPTION STATUS:", status);
+      });
+
+    typingChannelRef.current = channel;
+  }
+
+  async function broadcastTypingStatus(isTyping: boolean) {
+    if (
+      !currentUserId ||
+      !typingChannelRef.current ||
+      !typingChannelReadyRef.current
+    ) {
+      return;
+    }
+
+    const status = await typingChannelRef.current.send({
+      type: "broadcast",
+      event: "typing",
+      payload: {
+        user_id: currentUserId,
+        is_typing: isTyping,
+      },
+    });
+
+    if (status !== "ok") {
+      console.log("CHAT TYPING BROADCAST STATUS:", status);
+    }
+  }
+
+  function handleDraftChange(value: string) {
+    setDraft(value);
+
+    if (typingStopTimeoutRef.current) {
+      clearTimeout(typingStopTimeoutRef.current);
+      typingStopTimeoutRef.current = null;
+    }
+
+    if (!value.trim()) {
+      void broadcastTypingStatus(false);
+      return;
+    }
+
+    void broadcastTypingStatus(true);
+
+    typingStopTimeoutRef.current = setTimeout(() => {
+      void broadcastTypingStatus(false);
+      typingStopTimeoutRef.current = null;
+    }, 1500);
+  }
+
+  function subscribeToContactProfile(otherUserId: string) {
+    if (profileChannelRef.current) {
+      void supabase.removeChannel(profileChannelRef.current);
+    }
+
+    const channel = supabase
+      .channel(`contact-last-seen:${otherUserId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "profiles",
+          filter: `id=eq.${otherUserId}`,
+        },
+        (payload) => {
+          const updatedProfile = payload.new as ProfilePresenceRow;
+          setContactLastSeenAt(updatedProfile.last_seen_at ?? null);
+        },
+      )
+      .subscribe((status, error) => {
+        if (error) {
+          console.log("CONTACT LAST SEEN SUBSCRIPTION ERROR:", error);
+        }
+
+        console.log("CONTACT LAST SEEN SUBSCRIPTION STATUS:", status);
+      });
+
+    profileChannelRef.current = channel;
   }
 
   async function loadMessages(authenticatedUserId: string) {
@@ -162,7 +377,6 @@ export default function ChatScreen() {
 
     if (error) {
       console.log("LOAD CHAT MESSAGES ERROR:", error);
-
       setErrorMessage(error.message);
       setLoading(false);
       return;
@@ -191,7 +405,6 @@ export default function ChatScreen() {
     }
 
     const unreadMessageIds = unreadReceivedMessages.map((item) => item.id);
-
     const readTimestamp = new Date().toISOString();
 
     const { error } = await supabase
@@ -245,7 +458,6 @@ export default function ChatScreen() {
 
     if (error) {
       console.log("MARK INCOMING MESSAGE AS READ ERROR:", error);
-
       return;
     }
 
@@ -264,8 +476,8 @@ export default function ChatScreen() {
   function subscribeToMessages(authenticatedUserId: string) {
     if (!matchId) return;
 
-    if (realtimeChannelRef.current) {
-      void supabase.removeChannel(realtimeChannelRef.current);
+    if (messagesChannelRef.current) {
+      void supabase.removeChannel(messagesChannelRef.current);
     }
 
     const channel = supabase
@@ -327,7 +539,7 @@ export default function ChatScreen() {
         console.log("CHAT REALTIME SUBSCRIPTION STATUS:", status);
       });
 
-    realtimeChannelRef.current = channel;
+    messagesChannelRef.current = channel;
   }
 
   async function sendMessage() {
@@ -365,7 +577,6 @@ export default function ChatScreen() {
 
     if (error) {
       console.log("SEND CHAT MESSAGE ERROR:", error);
-
       setErrorMessage(error.message);
       setSending(false);
       return;
@@ -386,6 +597,13 @@ export default function ChatScreen() {
     });
 
     setDraft("");
+
+    if (typingStopTimeoutRef.current) {
+      clearTimeout(typingStopTimeoutRef.current);
+      typingStopTimeoutRef.current = null;
+    }
+
+    void broadcastTypingStatus(false);
     setSending(false);
 
     requestAnimationFrame(() => {
@@ -402,6 +620,54 @@ export default function ChatScreen() {
       hour: "2-digit",
       minute: "2-digit",
     });
+  }
+
+  function formatLastSeen(dateValue: string | null) {
+    if (!dateValue) {
+      return "Offline";
+    }
+
+    const date = new Date(dateValue);
+
+    if (Number.isNaN(date.getTime())) {
+      return "Offline";
+    }
+
+    const elapsedMilliseconds = Math.max(presenceClock - date.getTime(), 0);
+    const elapsedMinutes = Math.floor(elapsedMilliseconds / 60_000);
+    const elapsedHours = Math.floor(elapsedMinutes / 60);
+    const elapsedDays = Math.floor(elapsedHours / 24);
+
+    if (elapsedMinutes < 1) {
+      return "Last seen just now";
+    }
+
+    if (elapsedMinutes < 60) {
+      return `Last seen ${elapsedMinutes} ${
+        elapsedMinutes === 1 ? "minute" : "minutes"
+      } ago`;
+    }
+
+    if (elapsedHours < 24) {
+      return `Last seen ${elapsedHours} ${
+        elapsedHours === 1 ? "hour" : "hours"
+      } ago`;
+    }
+
+    if (elapsedDays === 1) {
+      return `Last seen yesterday at ${date.toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      })}`;
+    }
+
+    return `Last seen ${date.toLocaleDateString([], {
+      day: "2-digit",
+      month: "short",
+    })} at ${date.toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    })}`;
   }
 
   function renderMessage({ item }: { item: MessageRow }) {
@@ -459,7 +725,6 @@ export default function ChatScreen() {
     return (
       <View style={styles.centerContainer}>
         <ActivityIndicator size="large" color="#2C2C2C" />
-
         <Text style={styles.loadingText}>Loading conversation...</Text>
       </View>
     );
@@ -481,6 +746,10 @@ export default function ChatScreen() {
     );
   }
 
+  const presenceText = contactIsOnline
+    ? "Online"
+    : formatLastSeen(contactLastSeenAt);
+
   return (
     <KeyboardAvoidingView
       style={styles.screen}
@@ -496,23 +765,35 @@ export default function ChatScreen() {
           <Text style={styles.backText}>‹</Text>
         </Pressable>
 
-        {contactPhotoUrl ? (
-          <Image
-            source={{ uri: contactPhotoUrl }}
-            style={styles.headerAvatar}
-          />
-        ) : (
-          <View style={styles.headerPlaceholder}>
-            <Text style={styles.headerPlaceholderIcon}>👤</Text>
-          </View>
-        )}
+        <View style={styles.avatarContainer}>
+          {contactPhotoUrl ? (
+            <Image
+              source={{ uri: contactPhotoUrl }}
+              style={styles.headerAvatar}
+            />
+          ) : (
+            <View style={styles.headerPlaceholder}>
+              <Text style={styles.headerPlaceholderIcon}>👤</Text>
+            </View>
+          )}
+
+          {contactIsOnline ? <View style={styles.onlineDot} /> : null}
+        </View>
 
         <View style={styles.headerContent}>
           <Text style={styles.headerName} numberOfLines={1}>
             {contactName}
           </Text>
 
-          <Text style={styles.headerSubtitle}>Your match</Text>
+          <Text
+            style={[
+              styles.headerSubtitle,
+              contactIsOnline && styles.headerSubtitleOnline,
+            ]}
+            numberOfLines={1}
+          >
+            {presenceText}
+          </Text>
         </View>
       </View>
 
@@ -556,13 +837,21 @@ export default function ChatScreen() {
         }
       />
 
+      <View style={styles.typingIndicatorContainer}>
+        {contactIsTyping && contactIsOnline ? (
+          <Text style={styles.typingIndicatorText}>
+            {contactName} is typing...
+          </Text>
+        ) : null}
+      </View>
+
       <View style={styles.composerContainer}>
         <TextInput
           style={styles.composerInput}
           placeholder="Write a message..."
           placeholderTextColor="#888888"
           value={draft}
-          onChangeText={setDraft}
+          onChangeText={handleDraftChange}
           multiline
           maxLength={2000}
           editable={!sending}
@@ -626,6 +915,11 @@ const styles = StyleSheet.create({
     fontSize: 38,
     lineHeight: 39,
   },
+  avatarContainer: {
+    width: 46,
+    height: 46,
+    position: "relative",
+  },
   headerAvatar: {
     width: 46,
     height: 46,
@@ -643,6 +937,17 @@ const styles = StyleSheet.create({
   headerPlaceholderIcon: {
     fontSize: 21,
   },
+  onlineDot: {
+    position: "absolute",
+    right: 0,
+    bottom: 1,
+    width: 13,
+    height: 13,
+    borderRadius: 7,
+    backgroundColor: "#2EAD62",
+    borderWidth: 2,
+    borderColor: "#FFFFFF",
+  },
   headerContent: {
     flex: 1,
     marginLeft: 12,
@@ -656,6 +961,10 @@ const styles = StyleSheet.create({
     marginTop: 2,
     color: "#777777",
     fontSize: 12,
+  },
+  headerSubtitleOnline: {
+    color: "#23864A",
+    fontWeight: "700",
   },
   inlineError: {
     backgroundColor: "#FDECEC",
@@ -758,6 +1067,19 @@ const styles = StyleSheet.create({
   },
   readStatusRead: {
     color: "#9ED8FF",
+  },
+  typingIndicatorContainer: {
+    minHeight: 26,
+    backgroundColor: "#FFFFFF",
+    paddingHorizontal: 20,
+    paddingTop: 5,
+    justifyContent: "center",
+  },
+  typingIndicatorText: {
+    color: "#23864A",
+    fontSize: 12,
+    fontStyle: "italic",
+    fontWeight: "600",
   },
   composerContainer: {
     backgroundColor: "#FFFFFF",

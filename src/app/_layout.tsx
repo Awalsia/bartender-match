@@ -1,9 +1,9 @@
+import { startPresenceTracking, stopPresenceTracking } from "@/lib/presence";
 import {
   getNotificationNavigationData,
   registerForPushNotificationsAsync,
 } from "@/lib/pushNotifications";
 import { supabase } from "@/lib/supabase";
-import type { Subscription } from "expo-modules-core";
 import * as Notifications from "expo-notifications";
 import { router, Stack } from "expo-router";
 import { useEffect, useRef } from "react";
@@ -18,100 +18,147 @@ Notifications.setNotificationHandler({
 });
 
 export default function RootLayout() {
-  const notificationResponseSubscription = useRef<Subscription | null>(null);
-  const authSubscriptionInitialized = useRef(false);
+  const notificationResponseSubscription =
+    useRef<Notifications.EventSubscription | null>(null);
 
   useEffect(() => {
     let cancelled = false;
 
-    async function registerAuthenticatedUser() {
+    async function initializeAuthenticatedServices() {
       const {
-        data: { user },
-      } = await supabase.auth.getUser();
+        data: { session },
+        error,
+      } = await supabase.auth.getSession();
 
-      if (!user || cancelled) {
+      if (error) {
+        console.log("AUTHENTICATED SERVICES SESSION ERROR:", error);
         return;
       }
 
-      const result = await registerForPushNotificationsAsync();
+      if (!session?.user || cancelled) {
+        return;
+      }
 
-      if (result.status !== "registered") {
-        console.log("PUSH REGISTRATION STATUS:", result.status, result.message);
+      const pushResult = await registerForPushNotificationsAsync();
+
+      if (pushResult.status === "registered") {
+        console.log("PUSH REGISTRATION SUCCESS:", pushResult.token);
+      } else {
+        console.log(
+          "PUSH REGISTRATION STATUS:",
+          pushResult.status,
+          pushResult.message,
+        );
+      }
+
+      if (!cancelled) {
+        await startPresenceTracking();
       }
     }
 
-    void registerAuthenticatedUser();
+    void initializeAuthenticatedServices();
 
-    if (!authSubscriptionInitialized.current) {
-      authSubscriptionInitialized.current = true;
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((event, session) => {
+      console.log("ROOT AUTH STATE CHANGED:", event);
 
-      const {
-        data: { subscription },
-      } = supabase.auth.onAuthStateChange((event, session) => {
-        if (
-          (event === "SIGNED_IN" || event === "TOKEN_REFRESHED") &&
-          session?.user
-        ) {
-          setTimeout(() => {
-            void registerForPushNotificationsAsync();
-          }, 0);
-        }
-      });
+      if (
+        (event === "SIGNED_IN" ||
+          event === "TOKEN_REFRESHED" ||
+          event === "INITIAL_SESSION") &&
+        session?.user
+      ) {
+        setTimeout(() => {
+          if (cancelled) {
+            return;
+          }
 
-      return () => {
-        cancelled = true;
-        subscription.unsubscribe();
-      };
-    }
+          void registerForPushNotificationsAsync().then((result) => {
+            if (result.status === "registered") {
+              console.log("PUSH REGISTRATION SUCCESS:", result.token);
+              return;
+            }
 
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+            console.log(
+              "PUSH REGISTRATION STATUS:",
+              result.status,
+              result.message,
+            );
+          });
 
-  useEffect(() => {
-    notificationResponseSubscription.current =
-      Notifications.addNotificationResponseReceivedListener((response) => {
-        navigateFromNotification(response);
-      });
+          void startPresenceTracking();
+        }, 0);
+      }
 
-    void Notifications.getLastNotificationResponseAsync().then((response) => {
-      if (response) {
-        navigateFromNotification(response);
+      if (event === "SIGNED_OUT") {
+        setTimeout(() => {
+          void stopPresenceTracking();
+        }, 0);
       }
     });
 
     return () => {
-      notificationResponseSubscription.current?.remove();
+      cancelled = true;
+      subscription.unsubscribe();
+      void stopPresenceTracking();
     };
   }, []);
 
-  function navigateFromNotification(
-    response: Notifications.NotificationResponse,
-  ) {
-    const data = getNotificationNavigationData(response);
+  useEffect(() => {
+    function navigateFromNotification(
+      response: Notifications.NotificationResponse,
+    ) {
+      const data = getNotificationNavigationData(response);
 
-    const type = typeof data.type === "string" ? data.type : "";
-    const matchId =
-      typeof data.match_id === "string" ? data.match_id : undefined;
-    const name = typeof data.name === "string" ? data.name : "";
-    const photoUrl = typeof data.photo_url === "string" ? data.photo_url : "";
+      if (data.type === "message" && data.matchId) {
+        router.push({
+          pathname: "/chat/[matchId]",
+          params: {
+            matchId: data.matchId,
+            name: data.name ?? "",
+            photoUrl: data.photoUrl ?? "",
+          },
+        });
 
-    if (type === "message" && matchId) {
-      router.push({
-        pathname: "/chat/[matchId]",
-        params: {
-          matchId,
-          name,
-          photoUrl,
-        },
-      });
+        return;
+      }
 
-      return;
+      router.push("/notifications");
     }
 
-    router.push("/notifications");
-  }
+    notificationResponseSubscription.current =
+      Notifications.addNotificationResponseReceivedListener((response) => {
+        console.log(
+          "PUSH: User opened notification:",
+          response.notification.request.content.data,
+        );
+
+        navigateFromNotification(response);
+      });
+
+    void Notifications.getLastNotificationResponseAsync()
+      .then((response) => {
+        if (!response) {
+          return;
+        }
+
+        console.log(
+          "PUSH: App opened from previous notification:",
+          response.notification.request.content.data,
+        );
+
+        navigateFromNotification(response);
+      })
+      .catch((error) => {
+        console.log("PUSH: Could not read last notification response:", error);
+      });
+
+    return () => {
+      notificationResponseSubscription.current?.remove();
+      notificationResponseSubscription.current = null;
+    };
+  }, []);
 
   return <Stack screenOptions={{ headerShown: false }} />;
 }
