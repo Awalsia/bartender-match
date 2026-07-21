@@ -1,13 +1,17 @@
 import { isUserOnline, subscribeToOnlineUsers } from "@/lib/presence";
 import { supabase } from "@/lib/supabase";
 import type { RealtimeChannel } from "@supabase/supabase-js";
+import * as ImagePicker from "expo-image-picker";
+import { useVideoPlayer, VideoView } from "expo-video";
 import { router, useLocalSearchParams } from "expo-router";
 import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  Alert,
   FlatList,
   Image,
   KeyboardAvoidingView,
+  Modal,
   Platform,
   Pressable,
   StyleSheet,
@@ -21,9 +25,24 @@ type MessageRow = {
   match_id: string;
   sender_id: string;
   content: string;
+  message_type: "text" | "image" | "video" | "audio" | "file";
+  media_url: string | null;
+  media_width: number | null;
+  media_height: number | null;
   created_at: string;
   read_at: string | null;
+  reply_to_message_id: string | null;
 };
+
+type MessageReactionRow = {
+  id: string;
+  message_id: string;
+  user_id: string;
+  emoji: string;
+  created_at: string;
+};
+
+const QUICK_REACTIONS = ["❤️", "😂", "👍", "😮", "😢", "👏"] as const;
 
 type MatchRow = {
   id: string;
@@ -41,6 +60,76 @@ type RouteParams = {
   name?: string | string[];
   photoUrl?: string | string[];
 };
+
+type ChatVideoMessageProps = {
+  videoUrl: string;
+  aspectRatio?: number;
+  onPress: () => void;
+  onLongPress: () => void;
+};
+
+function ChatVideoMessage({
+  videoUrl,
+  aspectRatio,
+  onPress,
+  onLongPress,
+}: ChatVideoMessageProps) {
+  const player = useVideoPlayer(videoUrl, (videoPlayer) => {
+    videoPlayer.loop = false;
+  });
+
+  return (
+    <View style={styles.messageVideoContainer}>
+      <Pressable
+        onPress={onPress}
+        onLongPress={onLongPress}
+        delayLongPress={350}
+        accessibilityRole="button"
+        accessibilityLabel="Open video fullscreen"
+      >
+        <VideoView
+          player={player}
+          style={[
+            styles.messageVideo,
+            aspectRatio ? { aspectRatio } : undefined,
+          ]}
+          nativeControls
+          contentFit="contain"
+        />
+      </Pressable>
+
+      <Pressable
+        style={styles.videoFullscreenButton}
+        onPress={onPress}
+        hitSlop={8}
+        accessibilityRole="button"
+        accessibilityLabel="Open video fullscreen"
+      >
+        <Text style={styles.videoFullscreenButtonText}>⛶</Text>
+      </Pressable>
+    </View>
+  );
+}
+
+type FullscreenVideoProps = {
+  videoUrl: string;
+};
+
+function FullscreenVideo({ videoUrl }: FullscreenVideoProps) {
+  const player = useVideoPlayer(videoUrl, (videoPlayer) => {
+    videoPlayer.loop = false;
+  });
+
+  return (
+    <VideoView
+      player={player}
+      style={styles.fullscreenVideo}
+      nativeControls
+      contentFit="contain"
+      allowsFullscreen
+    />
+  );
+}
 
 export default function ChatScreen() {
   const params = useLocalSearchParams<RouteParams>();
@@ -73,10 +162,28 @@ export default function ChatScreen() {
   const [draft, setDraft] = useState("");
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
+  const [uploadingImage, setUploadingImage] = useState(false);
+  const [uploadingVideo, setUploadingVideo] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
+  const [fullscreenImageUrl, setFullscreenImageUrl] = useState<string | null>(
+    null,
+  );
+  const [fullscreenVideoUrl, setFullscreenVideoUrl] = useState<string | null>(
+    null,
+  );
+  const [replyingToMessage, setReplyingToMessage] = useState<MessageRow | null>(
+    null,
+  );
+  const [reactions, setReactions] = useState<MessageReactionRow[]>([]);
+  const [selectedMessage, setSelectedMessage] = useState<MessageRow | null>(
+    null,
+  );
+  const [updatingReaction, setUpdatingReaction] = useState(false);
 
   const listRef = useRef<FlatList<MessageRow>>(null);
+  const composerInputRef = useRef<TextInput>(null);
   const messagesChannelRef = useRef<RealtimeChannel | null>(null);
+  const reactionsChannelRef = useRef<RealtimeChannel | null>(null);
   const profileChannelRef = useRef<RealtimeChannel | null>(null);
   const typingChannelRef = useRef<RealtimeChannel | null>(null);
   const typingChannelReadyRef = useRef(false);
@@ -86,6 +193,8 @@ export default function ChatScreen() {
   const incomingTypingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   );
+  const initializationRunRef = useRef(0);
+  const realtimeSubscriptionCounterRef = useRef(0);
 
   useEffect(() => {
     if (!matchId) {
@@ -94,12 +203,20 @@ export default function ChatScreen() {
       return;
     }
 
-    void initializeChat();
+    const initializationRun = initializationRunRef.current + 1;
+    initializationRunRef.current = initializationRun;
+    void initializeChat(initializationRun);
 
     return () => {
+      initializationRunRef.current += 1;
       if (messagesChannelRef.current) {
         void supabase.removeChannel(messagesChannelRef.current);
         messagesChannelRef.current = null;
+      }
+
+      if (reactionsChannelRef.current) {
+        void supabase.removeChannel(reactionsChannelRef.current);
+        reactionsChannelRef.current = null;
       }
 
       if (typingStopTimeoutRef.current) {
@@ -152,13 +269,17 @@ export default function ChatScreen() {
     };
   }, []);
 
-  async function initializeChat() {
+  async function initializeChat(initializationRun: number) {
     if (!matchId) return;
 
     setLoading(true);
     setErrorMessage("");
 
     const { data: userData, error: userError } = await supabase.auth.getUser();
+
+    if (initializationRun !== initializationRunRef.current) {
+      return;
+    }
 
     if (userError || !userData.user) {
       console.log("LOAD CHAT USER ERROR:", userError);
@@ -173,6 +294,10 @@ export default function ChatScreen() {
       .select("id, bartender_user_id, employer_user_id")
       .eq("id", matchId)
       .maybeSingle();
+
+    if (initializationRun !== initializationRunRef.current) {
+      return;
+    }
 
     if (matchError) {
       console.log("LOAD CHAT MATCH ERROR:", matchError);
@@ -212,7 +337,12 @@ export default function ChatScreen() {
       loadContactPresenceProfile(otherUserId),
     ]);
 
+    if (initializationRun !== initializationRunRef.current) {
+      return;
+    }
+
     subscribeToMessages(authenticatedUserId);
+    subscribeToReactions();
     subscribeToContactProfile(otherUserId);
     subscribeToTyping(authenticatedUserId, otherUserId);
   }
@@ -237,13 +367,17 @@ export default function ChatScreen() {
     if (!matchId) return;
 
     if (typingChannelRef.current) {
-      void supabase.removeChannel(typingChannelRef.current);
+      const previousChannel = typingChannelRef.current;
+      typingChannelRef.current = null;
+      void supabase.removeChannel(previousChannel);
     }
 
     typingChannelReadyRef.current = false;
 
     const channel = supabase
-      .channel(`chat-typing:${matchId}`)
+      .channel(
+        `chat-typing:${matchId}:${++realtimeSubscriptionCounterRef.current}`,
+      )
       .on("broadcast", { event: "typing" }, ({ payload }) => {
         const typingUserId =
           typeof payload?.user_id === "string" ? payload.user_id : null;
@@ -328,11 +462,15 @@ export default function ChatScreen() {
 
   function subscribeToContactProfile(otherUserId: string) {
     if (profileChannelRef.current) {
-      void supabase.removeChannel(profileChannelRef.current);
+      const previousChannel = profileChannelRef.current;
+      profileChannelRef.current = null;
+      void supabase.removeChannel(previousChannel);
     }
 
     const channel = supabase
-      .channel(`contact-last-seen:${otherUserId}`)
+      .channel(
+        `contact-last-seen:${otherUserId}:${++realtimeSubscriptionCounterRef.current}`,
+      )
       .on(
         "postgres_changes",
         {
@@ -368,8 +506,13 @@ export default function ChatScreen() {
         match_id,
         sender_id,
         content,
+        message_type,
+        media_url,
+        media_width,
+        media_height,
         created_at,
-        read_at
+        read_at,
+        reply_to_message_id
         `,
       )
       .eq("match_id", matchId)
@@ -385,9 +528,123 @@ export default function ChatScreen() {
     const loadedMessages = (data ?? []) as MessageRow[];
 
     setMessages(loadedMessages);
+    await loadReactions(loadedMessages);
     setLoading(false);
 
     await markUnreadMessagesAsRead(authenticatedUserId, loadedMessages);
+  }
+
+  async function loadReactions(loadedMessages: MessageRow[]) {
+    const messageIds = loadedMessages.map((message) => message.id);
+
+    if (messageIds.length === 0) {
+      setReactions([]);
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from("message_reactions")
+      .select("id, message_id, user_id, emoji, created_at")
+      .in("message_id", messageIds)
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      console.log("LOAD MESSAGE REACTIONS ERROR:", error);
+      return;
+    }
+
+    setReactions((data ?? []) as MessageReactionRow[]);
+  }
+
+  function subscribeToReactions() {
+    if (reactionsChannelRef.current) {
+      const previousChannel = reactionsChannelRef.current;
+      reactionsChannelRef.current = null;
+      void supabase.removeChannel(previousChannel);
+    }
+
+    const channel = supabase
+      .channel(
+        `chat-reactions:${matchId}:${++realtimeSubscriptionCounterRef.current}`,
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "message_reactions",
+        },
+        (payload) => {
+          const incomingReaction = payload.new as MessageReactionRow;
+
+          setMessages((currentMessages) => {
+            const belongsToConversation = currentMessages.some(
+              (message) => message.id === incomingReaction.message_id,
+            );
+
+            if (!belongsToConversation) {
+              return currentMessages;
+            }
+
+            setReactions((currentReactions) => {
+              const withoutPreviousUserReaction = currentReactions.filter(
+                (reaction) =>
+                  !(
+                    reaction.message_id === incomingReaction.message_id &&
+                    reaction.user_id === incomingReaction.user_id
+                  ),
+              );
+
+              return [...withoutPreviousUserReaction, incomingReaction];
+            });
+
+            return currentMessages;
+          });
+        },
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "message_reactions",
+        },
+        (payload) => {
+          const updatedReaction = payload.new as MessageReactionRow;
+
+          setReactions((currentReactions) =>
+            currentReactions.map((reaction) =>
+              reaction.id === updatedReaction.id ? updatedReaction : reaction,
+            ),
+          );
+        },
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "DELETE",
+          schema: "public",
+          table: "message_reactions",
+        },
+        (payload) => {
+          const deletedReaction = payload.old as MessageReactionRow;
+
+          setReactions((currentReactions) =>
+            currentReactions.filter(
+              (reaction) => reaction.id !== deletedReaction.id,
+            ),
+          );
+        },
+      )
+      .subscribe((status, error) => {
+        if (error) {
+          console.log("CHAT REACTIONS SUBSCRIPTION ERROR:", error);
+        }
+
+        console.log("CHAT REACTIONS SUBSCRIPTION STATUS:", status);
+      });
+
+    reactionsChannelRef.current = channel;
   }
 
   async function markUnreadMessagesAsRead(
@@ -477,11 +734,15 @@ export default function ChatScreen() {
     if (!matchId) return;
 
     if (messagesChannelRef.current) {
-      void supabase.removeChannel(messagesChannelRef.current);
+      const previousChannel = messagesChannelRef.current;
+      messagesChannelRef.current = null;
+      void supabase.removeChannel(previousChannel);
     }
 
     const channel = supabase
-      .channel(`chat-messages:${matchId}`)
+      .channel(
+        `chat-messages:${matchId}:${++realtimeSubscriptionCounterRef.current}`,
+      )
       .on(
         "postgres_changes",
         {
@@ -562,6 +823,11 @@ export default function ChatScreen() {
         match_id: matchId,
         sender_id: currentUserId,
         content: trimmedContent,
+        message_type: "text",
+        media_url: null,
+        media_width: null,
+        media_height: null,
+        reply_to_message_id: replyingToMessage?.id ?? null,
       })
       .select(
         `
@@ -569,8 +835,13 @@ export default function ChatScreen() {
         match_id,
         sender_id,
         content,
+        message_type,
+        media_url,
+        media_width,
+        media_height,
         created_at,
-        read_at
+        read_at,
+        reply_to_message_id
         `,
       )
       .single();
@@ -597,6 +868,7 @@ export default function ChatScreen() {
     });
 
     setDraft("");
+    setReplyingToMessage(null);
 
     if (typingStopTimeoutRef.current) {
       clearTimeout(typingStopTimeoutRef.current);
@@ -611,6 +883,398 @@ export default function ChatScreen() {
         animated: true,
       });
     });
+  }
+
+  function getImageFileExtension(asset: ImagePicker.ImagePickerAsset) {
+    const mimeExtension = asset.mimeType?.split("/")[1]?.toLowerCase();
+
+    if (mimeExtension) {
+      return mimeExtension === "jpeg" ? "jpg" : mimeExtension;
+    }
+
+    const fileNameExtension = asset.fileName?.split(".").pop()?.toLowerCase();
+
+    if (fileNameExtension) {
+      return fileNameExtension === "jpeg" ? "jpg" : fileNameExtension;
+    }
+
+    const uriWithoutQuery = asset.uri.split("?")[0];
+    const uriExtension = uriWithoutQuery.split(".").pop()?.toLowerCase();
+
+    if (uriExtension && uriExtension.length <= 5) {
+      return uriExtension === "jpeg" ? "jpg" : uriExtension;
+    }
+
+    return "jpg";
+  }
+
+  function getImageContentType(
+    asset: ImagePicker.ImagePickerAsset,
+    extension: string,
+  ) {
+    if (asset.mimeType) {
+      return asset.mimeType;
+    }
+
+    if (extension === "jpg" || extension === "jpeg") {
+      return "image/jpeg";
+    }
+
+    return `image/${extension}`;
+  }
+
+  async function pickAndSendImage() {
+    if (!matchId || !currentUserId || sending || uploadingImage) {
+      return;
+    }
+
+    setErrorMessage("");
+
+    const permissionResult =
+      await ImagePicker.requestMediaLibraryPermissionsAsync();
+
+    if (!permissionResult.granted) {
+      Alert.alert(
+        "Permission required",
+        "Allow access to your photos to send an image in the chat.",
+      );
+      return;
+    }
+
+    const pickerResult = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ["images"],
+      allowsEditing: false,
+      quality: 0.85,
+      selectionLimit: 1,
+    });
+
+    if (pickerResult.canceled || !pickerResult.assets[0]) {
+      return;
+    }
+
+    const asset = pickerResult.assets[0];
+
+    if (asset.fileSize && asset.fileSize > 10 * 1024 * 1024) {
+      Alert.alert("Image too large", "Choose an image smaller than 10 MB.");
+      return;
+    }
+
+    setUploadingImage(true);
+    void broadcastTypingStatus(false);
+
+    let storagePath: string | null = null;
+
+    try {
+      const extension = getImageFileExtension(asset);
+      const contentType = getImageContentType(asset, extension);
+      const safeRandomValue = Math.random().toString(36).slice(2, 10);
+
+      storagePath = `${matchId}/${currentUserId}/${Date.now()}-${safeRandomValue}.${extension}`;
+
+      const response = await fetch(asset.uri);
+
+      if (!response.ok) {
+        throw new Error("The selected image could not be read.");
+      }
+
+      const arrayBuffer = await response.arrayBuffer();
+
+      const { error: uploadError } = await supabase.storage
+        .from("chat-media")
+        .upload(storagePath, arrayBuffer, {
+          contentType,
+          cacheControl: "3600",
+          upsert: false,
+        });
+
+      if (uploadError) {
+        throw uploadError;
+      }
+
+      const { data: publicUrlData } = supabase.storage
+        .from("chat-media")
+        .getPublicUrl(storagePath);
+
+      const mediaUrl = publicUrlData.publicUrl;
+
+      if (!mediaUrl) {
+        throw new Error("The image URL could not be created.");
+      }
+
+      const { data, error: insertError } = await supabase
+        .from("messages")
+        .insert({
+          match_id: matchId,
+          sender_id: currentUserId,
+          content: "",
+          message_type: "image",
+          media_url: mediaUrl,
+          media_width: asset.width || null,
+          media_height: asset.height || null,
+          reply_to_message_id: replyingToMessage?.id ?? null,
+        })
+        .select(
+          `
+          id,
+          match_id,
+          sender_id,
+          content,
+          message_type,
+          media_url,
+          media_width,
+          media_height,
+          created_at,
+          read_at,
+          reply_to_message_id
+          `,
+        )
+        .single();
+
+      if (insertError) {
+        await supabase.storage.from("chat-media").remove([storagePath]);
+        throw insertError;
+      }
+
+      const insertedMessage = data as MessageRow;
+
+      setMessages((currentMessages) => {
+        const alreadyExists = currentMessages.some(
+          (item) => item.id === insertedMessage.id,
+        );
+
+        return alreadyExists
+          ? currentMessages
+          : [...currentMessages, insertedMessage];
+      });
+
+      setReplyingToMessage(null);
+
+      requestAnimationFrame(() => {
+        listRef.current?.scrollToEnd({ animated: true });
+      });
+    } catch (error) {
+      console.log("SEND CHAT IMAGE ERROR:", error);
+
+      const message =
+        error instanceof Error ? error.message : "The image could not be sent.";
+
+      setErrorMessage(message);
+      Alert.alert("Upload failed", message);
+    } finally {
+      setUploadingImage(false);
+    }
+  }
+
+  function getVideoFileExtension(asset: ImagePicker.ImagePickerAsset) {
+    const mimeExtension = asset.mimeType?.split("/")[1]?.toLowerCase();
+
+    if (mimeExtension) {
+      return mimeExtension === "quicktime" ? "mov" : mimeExtension;
+    }
+
+    const fileNameExtension = asset.fileName?.split(".").pop()?.toLowerCase();
+
+    if (fileNameExtension) {
+      return fileNameExtension;
+    }
+
+    const uriWithoutQuery = asset.uri.split("?")[0];
+    const uriExtension = uriWithoutQuery.split(".").pop()?.toLowerCase();
+
+    if (uriExtension && uriExtension.length <= 6) {
+      return uriExtension;
+    }
+
+    return "mp4";
+  }
+
+  function getVideoContentType(
+    asset: ImagePicker.ImagePickerAsset,
+    extension: string,
+  ) {
+    if (asset.mimeType) {
+      return asset.mimeType;
+    }
+
+    if (extension === "mov") {
+      return "video/quicktime";
+    }
+
+    return `video/${extension}`;
+  }
+
+  async function pickAndSendVideo() {
+    if (
+      !matchId ||
+      !currentUserId ||
+      sending ||
+      uploadingImage ||
+      uploadingVideo
+    ) {
+      return;
+    }
+
+    setErrorMessage("");
+
+    const permissionResult =
+      await ImagePicker.requestMediaLibraryPermissionsAsync();
+
+    if (!permissionResult.granted) {
+      Alert.alert(
+        "Permission required",
+        "Allow access to your media library to send a video in the chat.",
+      );
+      return;
+    }
+
+    const pickerResult = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ["videos"],
+      allowsEditing: false,
+      quality: 1,
+      selectionLimit: 1,
+    });
+
+    if (pickerResult.canceled || !pickerResult.assets[0]) {
+      return;
+    }
+
+    const asset = pickerResult.assets[0];
+
+    if (asset.fileSize && asset.fileSize > 50 * 1024 * 1024) {
+      Alert.alert("Video too large", "Choose a video smaller than 50 MB.");
+      return;
+    }
+
+    if (asset.duration && asset.duration > 60_000) {
+      Alert.alert("Video too long", "Choose a video up to 60 seconds long.");
+      return;
+    }
+
+    setUploadingVideo(true);
+    void broadcastTypingStatus(false);
+
+    let storagePath: string | null = null;
+
+    try {
+      const extension = getVideoFileExtension(asset);
+      const contentType = getVideoContentType(asset, extension);
+      const safeRandomValue = Math.random().toString(36).slice(2, 10);
+
+      storagePath = `${matchId}/${currentUserId}/${Date.now()}-${safeRandomValue}.${extension}`;
+
+      const response = await fetch(asset.uri);
+
+      if (!response.ok) {
+        throw new Error("The selected video could not be read.");
+      }
+
+      const arrayBuffer = await response.arrayBuffer();
+
+      const { error: uploadError } = await supabase.storage
+        .from("chat-media")
+        .upload(storagePath, arrayBuffer, {
+          contentType,
+          cacheControl: "3600",
+          upsert: false,
+        });
+
+      if (uploadError) {
+        throw uploadError;
+      }
+
+      const { data: publicUrlData } = supabase.storage
+        .from("chat-media")
+        .getPublicUrl(storagePath);
+
+      const mediaUrl = publicUrlData.publicUrl;
+
+      if (!mediaUrl) {
+        throw new Error("The video URL could not be created.");
+      }
+
+      const { data, error: insertError } = await supabase
+        .from("messages")
+        .insert({
+          match_id: matchId,
+          sender_id: currentUserId,
+          content: "",
+          message_type: "video",
+          media_url: mediaUrl,
+          media_width: asset.width || null,
+          media_height: asset.height || null,
+          reply_to_message_id: replyingToMessage?.id ?? null,
+        })
+        .select(
+          `
+          id,
+          match_id,
+          sender_id,
+          content,
+          message_type,
+          media_url,
+          media_width,
+          media_height,
+          created_at,
+          read_at,
+          reply_to_message_id
+          `,
+        )
+        .single();
+
+      if (insertError) {
+        await supabase.storage.from("chat-media").remove([storagePath]);
+        throw insertError;
+      }
+
+      const insertedMessage = data as MessageRow;
+
+      setMessages((currentMessages) => {
+        const alreadyExists = currentMessages.some(
+          (item) => item.id === insertedMessage.id,
+        );
+
+        return alreadyExists
+          ? currentMessages
+          : [...currentMessages, insertedMessage];
+      });
+
+      setReplyingToMessage(null);
+
+      requestAnimationFrame(() => {
+        listRef.current?.scrollToEnd({ animated: true });
+      });
+    } catch (error) {
+      console.log("SEND CHAT VIDEO ERROR:", error);
+
+      const message =
+        error instanceof Error ? error.message : "The video could not be sent.";
+
+      setErrorMessage(message);
+      Alert.alert("Upload failed", message);
+    } finally {
+      setUploadingVideo(false);
+    }
+  }
+
+  function openAttachmentMenu() {
+    if (sending || uploadingImage || uploadingVideo) {
+      return;
+    }
+
+    Alert.alert("Send media", "Choose what you want to send.", [
+      {
+        text: "Photo",
+        onPress: () => void pickAndSendImage(),
+      },
+      {
+        text: "Video",
+        onPress: () => void pickAndSendVideo(),
+      },
+      {
+        text: "Cancel",
+        style: "cancel",
+      },
+    ]);
   }
 
   function formatMessageTime(dateValue: string) {
@@ -670,8 +1334,212 @@ export default function ChatScreen() {
     })}`;
   }
 
+  function startReply(message: MessageRow) {
+    setSelectedMessage(null);
+    setReplyingToMessage(message);
+    requestAnimationFrame(() => {
+      composerInputRef.current?.focus();
+    });
+  }
+
+  function openMessageActions(message: MessageRow) {
+    setSelectedMessage(message);
+  }
+
+  function closeMessageActions() {
+    if (updatingReaction) {
+      return;
+    }
+
+    setSelectedMessage(null);
+  }
+
+  async function toggleReaction(message: MessageRow, emoji: string) {
+    if (!currentUserId || updatingReaction) {
+      return;
+    }
+
+    const existingReaction = reactions.find(
+      (reaction) =>
+        reaction.message_id === message.id &&
+        reaction.user_id === currentUserId,
+    );
+
+    setUpdatingReaction(true);
+    setErrorMessage("");
+
+    if (existingReaction?.emoji === emoji) {
+      setReactions((currentReactions) =>
+        currentReactions.filter(
+          (reaction) => reaction.id !== existingReaction.id,
+        ),
+      );
+
+      const { error } = await supabase
+        .from("message_reactions")
+        .delete()
+        .eq("id", existingReaction.id)
+        .eq("user_id", currentUserId);
+
+      if (error) {
+        console.log("REMOVE MESSAGE REACTION ERROR:", error);
+        setReactions((currentReactions) => [
+          ...currentReactions,
+          existingReaction,
+        ]);
+        setErrorMessage(error.message);
+      }
+
+      setUpdatingReaction(false);
+      setSelectedMessage(null);
+      return;
+    }
+
+    const optimisticReaction: MessageReactionRow = {
+      id: existingReaction?.id ?? `optimistic-${message.id}-${currentUserId}`,
+      message_id: message.id,
+      user_id: currentUserId,
+      emoji,
+      created_at: existingReaction?.created_at ?? new Date().toISOString(),
+    };
+
+    setReactions((currentReactions) => [
+      ...currentReactions.filter(
+        (reaction) =>
+          !(
+            reaction.message_id === message.id &&
+            reaction.user_id === currentUserId
+          ),
+      ),
+      optimisticReaction,
+    ]);
+
+    const { data, error } = await supabase
+      .from("message_reactions")
+      .upsert(
+        {
+          message_id: message.id,
+          user_id: currentUserId,
+          emoji,
+        },
+        {
+          onConflict: "message_id,user_id",
+        },
+      )
+      .select("id, message_id, user_id, emoji, created_at")
+      .single();
+
+    if (error) {
+      console.log("SAVE MESSAGE REACTION ERROR:", error);
+      setReactions((currentReactions) => [
+        ...currentReactions.filter(
+          (reaction) =>
+            !(
+              reaction.message_id === message.id &&
+              reaction.user_id === currentUserId
+            ),
+        ),
+        ...(existingReaction ? [existingReaction] : []),
+      ]);
+      setErrorMessage(error.message);
+    } else {
+      const savedReaction = data as MessageReactionRow;
+
+      setReactions((currentReactions) => [
+        ...currentReactions.filter(
+          (reaction) =>
+            !(
+              reaction.message_id === message.id &&
+              reaction.user_id === currentUserId
+            ),
+        ),
+        savedReaction,
+      ]);
+    }
+
+    setUpdatingReaction(false);
+    setSelectedMessage(null);
+  }
+
+  function getGroupedReactions(messageId: string) {
+    const reactionCounts = new Map<string, number>();
+
+    reactions
+      .filter((reaction) => reaction.message_id === messageId)
+      .forEach((reaction) => {
+        reactionCounts.set(
+          reaction.emoji,
+          (reactionCounts.get(reaction.emoji) ?? 0) + 1,
+        );
+      });
+
+    return Array.from(reactionCounts.entries()).map(([emoji, count]) => ({
+      emoji,
+      count,
+      reactedByCurrentUser: reactions.some(
+        (reaction) =>
+          reaction.message_id === messageId &&
+          reaction.user_id === currentUserId &&
+          reaction.emoji === emoji,
+      ),
+    }));
+  }
+
+  function cancelReply() {
+    setReplyingToMessage(null);
+  }
+
+  function getReplyPreviewText(message: MessageRow) {
+    if (message.message_type === "image") {
+      return "📷 Photo";
+    }
+
+    if (message.message_type === "video") {
+      return "🎥 Video";
+    }
+
+    return message.content.trim() || "Message";
+  }
+
+  function scrollToMessage(messageId: string) {
+    const messageIndex = messages.findIndex(
+      (message) => message.id === messageId,
+    );
+
+    if (messageIndex < 0) {
+      return;
+    }
+
+    listRef.current?.scrollToIndex({
+      index: messageIndex,
+      animated: true,
+      viewPosition: 0.5,
+    });
+  }
+
+  function openFullscreenImage(imageUrl: string) {
+    setFullscreenImageUrl(imageUrl);
+  }
+
+  function closeFullscreenImage() {
+    setFullscreenImageUrl(null);
+  }
+
+  function openFullscreenVideo(videoUrl: string) {
+    setFullscreenVideoUrl(videoUrl);
+  }
+
+  function closeFullscreenVideo() {
+    setFullscreenVideoUrl(null);
+  }
+
   function renderMessage({ item }: { item: MessageRow }) {
     const isMine = item.sender_id === currentUserId;
+    const groupedReactions = getGroupedReactions(item.id);
+    const repliedMessage = item.reply_to_message_id
+      ? (messages.find((message) => message.id === item.reply_to_message_id) ??
+        null)
+      : null;
 
     return (
       <View
@@ -680,22 +1548,127 @@ export default function ChatScreen() {
           isMine ? styles.myMessageRow : styles.otherMessageRow,
         ]}
       >
-        <View
+        <Pressable
           style={[
             styles.messageBubble,
             isMine ? styles.myMessageBubble : styles.otherMessageBubble,
+            (item.message_type === "image" || item.message_type === "video") &&
+              styles.imageMessageBubble,
           ]}
+          onLongPress={() => openMessageActions(item)}
+          delayLongPress={350}
+          accessibilityRole="button"
+          accessibilityLabel="Hold for message actions"
         >
-          <Text
+          {repliedMessage ? (
+            <Pressable
+              style={[
+                styles.quotedMessage,
+                isMine ? styles.myQuotedMessage : styles.otherQuotedMessage,
+              ]}
+              onPress={() => scrollToMessage(repliedMessage.id)}
+              accessibilityRole="button"
+              accessibilityLabel="Go to replied message"
+            >
+              <View
+                style={[
+                  styles.quotedMessageLine,
+                  isMine
+                    ? styles.myQuotedMessageLine
+                    : styles.otherQuotedMessageLine,
+                ]}
+              />
+
+              {repliedMessage.message_type === "image" &&
+              repliedMessage.media_url ? (
+                <Image
+                  source={{ uri: repliedMessage.media_url }}
+                  style={styles.quotedMessageThumbnail}
+                  resizeMode="cover"
+                />
+              ) : null}
+
+              <View style={styles.quotedMessageContent}>
+                <Text
+                  style={[
+                    styles.quotedMessageAuthor,
+                    isMine
+                      ? styles.myQuotedMessageAuthor
+                      : styles.otherQuotedMessageAuthor,
+                  ]}
+                  numberOfLines={1}
+                >
+                  {repliedMessage.sender_id === currentUserId
+                    ? "You"
+                    : contactName}
+                </Text>
+
+                <Text
+                  style={[
+                    styles.quotedMessageText,
+                    isMine
+                      ? styles.myQuotedMessageText
+                      : styles.otherQuotedMessageText,
+                  ]}
+                  numberOfLines={2}
+                >
+                  {getReplyPreviewText(repliedMessage)}
+                </Text>
+              </View>
+            </Pressable>
+          ) : null}
+
+          {item.message_type === "image" && item.media_url ? (
+            <Pressable
+              onPress={() => openFullscreenImage(item.media_url as string)}
+              onLongPress={() => openMessageActions(item)}
+              delayLongPress={350}
+              accessibilityRole="button"
+              accessibilityLabel="Open image fullscreen"
+            >
+              <Image
+                source={{ uri: item.media_url }}
+                style={[
+                  styles.messageImage,
+                  item.media_width && item.media_height
+                    ? {
+                        aspectRatio: item.media_width / item.media_height,
+                      }
+                    : undefined,
+                ]}
+                resizeMode="cover"
+              />
+            </Pressable>
+          ) : item.message_type === "video" && item.media_url ? (
+            <ChatVideoMessage
+              videoUrl={item.media_url}
+              onPress={() => openFullscreenVideo(item.media_url as string)}
+              aspectRatio={
+                item.media_width && item.media_height
+                  ? item.media_width / item.media_height
+                  : undefined
+              }
+              onLongPress={() => openMessageActions(item)}
+            />
+          ) : (
+            <Text
+              style={[
+                styles.messageContent,
+                isMine ? styles.myMessageContent : styles.otherMessageContent,
+              ]}
+            >
+              {item.content}
+            </Text>
+          )}
+
+          <View
             style={[
-              styles.messageContent,
-              isMine ? styles.myMessageContent : styles.otherMessageContent,
+              styles.messageFooter,
+              (item.message_type === "image" ||
+                item.message_type === "video") &&
+                styles.imageMessageFooter,
             ]}
           >
-            {item.content}
-          </Text>
-
-          <View style={styles.messageFooter}>
             <Text
               style={[
                 styles.messageTime,
@@ -716,7 +1689,39 @@ export default function ChatScreen() {
               </Text>
             ) : null}
           </View>
-        </View>
+        </Pressable>
+
+        {groupedReactions.length > 0 ? (
+          <View
+            style={[
+              styles.reactionsContainer,
+              isMine
+                ? styles.myReactionsContainer
+                : styles.otherReactionsContainer,
+            ]}
+          >
+            {groupedReactions.map((reaction) => (
+              <Pressable
+                key={reaction.emoji}
+                style={[
+                  styles.reactionBadge,
+                  reaction.reactedByCurrentUser && styles.myReactionBadge,
+                ]}
+                onPress={() => void toggleReaction(item, reaction.emoji)}
+                disabled={updatingReaction}
+                accessibilityRole="button"
+                accessibilityLabel={`${reaction.emoji} reaction, ${reaction.count}`}
+              >
+                <Text style={styles.reactionBadgeEmoji}>{reaction.emoji}</Text>
+                {reaction.count > 1 ? (
+                  <Text style={styles.reactionBadgeCount}>
+                    {reaction.count}
+                  </Text>
+                ) : null}
+              </Pressable>
+            ))}
+          </View>
+        ) : null}
       </View>
     );
   }
@@ -814,6 +1819,15 @@ export default function ChatScreen() {
         }
         keyboardShouldPersistTaps="handled"
         showsVerticalScrollIndicator={false}
+        onScrollToIndexFailed={({ index }) => {
+          setTimeout(() => {
+            listRef.current?.scrollToIndex({
+              index,
+              animated: true,
+              viewPosition: 0.5,
+            });
+          }, 250);
+        }}
         onContentSizeChange={() => {
           if (messages.length > 0) {
             listRef.current?.scrollToEnd({
@@ -845,33 +1859,215 @@ export default function ChatScreen() {
         ) : null}
       </View>
 
-      <View style={styles.composerContainer}>
-        <TextInput
-          style={styles.composerInput}
-          placeholder="Write a message..."
-          placeholderTextColor="#888888"
-          value={draft}
-          onChangeText={handleDraftChange}
-          multiline
-          maxLength={2000}
-          editable={!sending}
-        />
+      <View style={styles.composerSection}>
+        {replyingToMessage ? (
+          <View style={styles.replyComposerPreview}>
+            <View style={styles.replyComposerLine} />
 
-        <Pressable
-          style={[
-            styles.sendButton,
-            (!draft.trim() || sending) && styles.sendButtonDisabled,
-          ]}
-          onPress={() => void sendMessage()}
-          disabled={!draft.trim() || sending}
-        >
-          {sending ? (
-            <ActivityIndicator size="small" color="#FFFFFF" />
-          ) : (
-            <Text style={styles.sendButtonText}>➤</Text>
-          )}
-        </Pressable>
+            {replyingToMessage.message_type === "image" &&
+            replyingToMessage.media_url ? (
+              <Image
+                source={{ uri: replyingToMessage.media_url }}
+                style={styles.replyComposerThumbnail}
+                resizeMode="cover"
+              />
+            ) : replyingToMessage.message_type === "video" ? (
+              <View style={styles.replyComposerVideoThumbnail}>
+                <Text style={styles.replyComposerVideoIcon}>▶</Text>
+              </View>
+            ) : null}
+
+            <View style={styles.replyComposerContent}>
+              <Text style={styles.replyComposerTitle} numberOfLines={1}>
+                Replying to{" "}
+                {replyingToMessage.sender_id === currentUserId
+                  ? "yourself"
+                  : contactName}
+              </Text>
+
+              <Text style={styles.replyComposerText} numberOfLines={1}>
+                {getReplyPreviewText(replyingToMessage)}
+              </Text>
+            </View>
+
+            <Pressable
+              style={styles.cancelReplyButton}
+              onPress={cancelReply}
+              hitSlop={10}
+              accessibilityRole="button"
+              accessibilityLabel="Cancel reply"
+            >
+              <Text style={styles.cancelReplyButtonText}>✕</Text>
+            </Pressable>
+          </View>
+        ) : null}
+
+        <View style={styles.composerContainer}>
+          <Pressable
+            style={[
+              styles.attachmentButton,
+              (sending || uploadingImage || uploadingVideo) &&
+                styles.attachmentButtonDisabled,
+            ]}
+            onPress={openAttachmentMenu}
+            disabled={sending || uploadingImage || uploadingVideo}
+            hitSlop={6}
+          >
+            {uploadingImage || uploadingVideo ? (
+              <ActivityIndicator size="small" color="#2C2C2C" />
+            ) : (
+              <Text style={styles.attachmentButtonText}>＋</Text>
+            )}
+          </Pressable>
+
+          <TextInput
+            ref={composerInputRef}
+            style={styles.composerInput}
+            placeholder="Write a message..."
+            placeholderTextColor="#888888"
+            value={draft}
+            onChangeText={handleDraftChange}
+            multiline
+            maxLength={2000}
+            editable={!sending && !uploadingImage && !uploadingVideo}
+          />
+
+          <Pressable
+            style={[
+              styles.sendButton,
+              (!draft.trim() || sending || uploadingImage || uploadingVideo) &&
+                styles.sendButtonDisabled,
+            ]}
+            onPress={() => void sendMessage()}
+            disabled={
+              !draft.trim() || sending || uploadingImage || uploadingVideo
+            }
+          >
+            {sending ? (
+              <ActivityIndicator size="small" color="#FFFFFF" />
+            ) : (
+              <Text style={styles.sendButtonText}>➤</Text>
+            )}
+          </Pressable>
+        </View>
       </View>
+
+      <Modal
+        visible={Boolean(selectedMessage)}
+        transparent
+        animationType="fade"
+        statusBarTranslucent
+        onRequestClose={closeMessageActions}
+      >
+        <Pressable
+          style={styles.messageActionsBackdrop}
+          onPress={closeMessageActions}
+        >
+          <Pressable
+            style={styles.messageActionsCard}
+            onPress={(event) => event.stopPropagation()}
+          >
+            <View style={styles.quickReactionsRow}>
+              {QUICK_REACTIONS.map((emoji) => {
+                const isSelected = reactions.some(
+                  (reaction) =>
+                    reaction.message_id === selectedMessage?.id &&
+                    reaction.user_id === currentUserId &&
+                    reaction.emoji === emoji,
+                );
+
+                return (
+                  <Pressable
+                    key={emoji}
+                    style={[
+                      styles.quickReactionButton,
+                      isSelected && styles.quickReactionButtonSelected,
+                    ]}
+                    onPress={() => {
+                      if (selectedMessage) {
+                        void toggleReaction(selectedMessage, emoji);
+                      }
+                    }}
+                    disabled={updatingReaction}
+                    accessibilityRole="button"
+                    accessibilityLabel={`React with ${emoji}`}
+                  >
+                    <Text style={styles.quickReactionEmoji}>{emoji}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+
+            <View style={styles.messageActionsDivider} />
+
+            <Pressable
+              style={styles.messageActionButton}
+              onPress={() => {
+                if (selectedMessage) {
+                  startReply(selectedMessage);
+                }
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="Reply to message"
+            >
+              <Text style={styles.messageActionIcon}>↩</Text>
+              <Text style={styles.messageActionText}>Reply</Text>
+            </Pressable>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      <Modal
+        visible={Boolean(fullscreenImageUrl)}
+        transparent={false}
+        animationType="fade"
+        statusBarTranslucent
+        onRequestClose={closeFullscreenImage}
+      >
+        <View style={styles.fullscreenImageContainer}>
+          <Pressable
+            style={styles.fullscreenCloseButton}
+            onPress={closeFullscreenImage}
+            hitSlop={12}
+            accessibilityRole="button"
+            accessibilityLabel="Close fullscreen image"
+          >
+            <Text style={styles.fullscreenCloseButtonText}>✕</Text>
+          </Pressable>
+
+          {fullscreenImageUrl ? (
+            <Image
+              source={{ uri: fullscreenImageUrl }}
+              style={styles.fullscreenImage}
+              resizeMode="contain"
+            />
+          ) : null}
+        </View>
+      </Modal>
+
+      <Modal
+        visible={Boolean(fullscreenVideoUrl)}
+        transparent={false}
+        animationType="fade"
+        statusBarTranslucent
+        onRequestClose={closeFullscreenVideo}
+      >
+        <View style={styles.fullscreenVideoContainer}>
+          <Pressable
+            style={styles.fullscreenCloseButton}
+            onPress={closeFullscreenVideo}
+            hitSlop={12}
+            accessibilityRole="button"
+            accessibilityLabel="Close fullscreen video"
+          >
+            <Text style={styles.fullscreenCloseButtonText}>✕</Text>
+          </Pressable>
+
+          {fullscreenVideoUrl ? (
+            <FullscreenVideo videoUrl={fullscreenVideoUrl} />
+          ) : null}
+        </View>
+      </Modal>
     </KeyboardAvoidingView>
   );
 }
@@ -1032,6 +2228,105 @@ const styles = StyleSheet.create({
     borderColor: "#E5E0D8",
     borderBottomLeftRadius: 5,
   },
+  imageMessageBubble: {
+    width: 250,
+    paddingHorizontal: 4,
+    paddingTop: 4,
+    paddingBottom: 5,
+    overflow: "hidden",
+  },
+  messageImage: {
+    width: "100%",
+    minHeight: 150,
+    maxHeight: 320,
+    borderRadius: 15,
+    backgroundColor: "#E5E0D8",
+  },
+  messageVideoContainer: {
+    position: "relative",
+    width: "100%",
+  },
+  messageVideo: {
+    width: "100%",
+    minHeight: 180,
+    maxHeight: 320,
+    borderRadius: 15,
+    backgroundColor: "#000000",
+    overflow: "hidden",
+  },
+  videoFullscreenButton: {
+    position: "absolute",
+    top: 8,
+    right: 8,
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: "rgba(0, 0, 0, 0.58)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  videoFullscreenButtonText: {
+    color: "#FFFFFF",
+    fontSize: 20,
+    lineHeight: 22,
+    fontWeight: "700",
+  },
+  quotedMessage: {
+    minHeight: 52,
+    marginBottom: 7,
+    borderRadius: 12,
+    flexDirection: "row",
+    overflow: "hidden",
+  },
+  myQuotedMessage: {
+    backgroundColor: "rgba(255, 255, 255, 0.12)",
+  },
+  otherQuotedMessage: {
+    backgroundColor: "#F3F1ED",
+  },
+  quotedMessageLine: {
+    width: 4,
+  },
+  myQuotedMessageLine: {
+    backgroundColor: "#9ED8FF",
+  },
+  otherQuotedMessageLine: {
+    backgroundColor: "#2C2C2C",
+  },
+  quotedMessageThumbnail: {
+    width: 48,
+    height: 48,
+    margin: 4,
+    borderRadius: 8,
+    backgroundColor: "#E5E0D8",
+  },
+  quotedMessageContent: {
+    flex: 1,
+    justifyContent: "center",
+    paddingHorizontal: 9,
+    paddingVertical: 7,
+  },
+  quotedMessageAuthor: {
+    fontSize: 12,
+    fontWeight: "800",
+  },
+  myQuotedMessageAuthor: {
+    color: "#9ED8FF",
+  },
+  otherQuotedMessageAuthor: {
+    color: "#2C2C2C",
+  },
+  quotedMessageText: {
+    marginTop: 2,
+    fontSize: 12,
+    lineHeight: 16,
+  },
+  myQuotedMessageText: {
+    color: "#F2F2F2",
+  },
+  otherQuotedMessageText: {
+    color: "#666666",
+  },
   messageContent: {
     fontSize: 16,
     lineHeight: 21,
@@ -1047,6 +2342,9 @@ const styles = StyleSheet.create({
     alignSelf: "flex-end",
     flexDirection: "row",
     alignItems: "center",
+  },
+  imageMessageFooter: {
+    paddingHorizontal: 7,
   },
   messageTime: {
     fontSize: 10,
@@ -1068,6 +2366,46 @@ const styles = StyleSheet.create({
   readStatusRead: {
     color: "#9ED8FF",
   },
+  reactionsContainer: {
+    marginTop: -3,
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 4,
+    zIndex: 2,
+  },
+  myReactionsContainer: {
+    alignSelf: "flex-end",
+    marginRight: 7,
+  },
+  otherReactionsContainer: {
+    alignSelf: "flex-start",
+    marginLeft: 7,
+  },
+  reactionBadge: {
+    minWidth: 31,
+    height: 25,
+    paddingHorizontal: 7,
+    borderRadius: 13,
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: "#E5E0D8",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  myReactionBadge: {
+    borderColor: "#7BC9F5",
+    backgroundColor: "#EAF7FF",
+  },
+  reactionBadgeEmoji: {
+    fontSize: 14,
+  },
+  reactionBadgeCount: {
+    marginLeft: 3,
+    color: "#555555",
+    fontSize: 11,
+    fontWeight: "700",
+  },
   typingIndicatorContainer: {
     minHeight: 26,
     backgroundColor: "#FFFFFF",
@@ -1081,16 +2419,99 @@ const styles = StyleSheet.create({
     fontStyle: "italic",
     fontWeight: "600",
   },
-  composerContainer: {
+  composerSection: {
     backgroundColor: "#FFFFFF",
     borderTopWidth: 1,
     borderTopColor: "#E5E0D8",
+  },
+  replyComposerPreview: {
+    minHeight: 62,
+    marginHorizontal: 12,
+    marginTop: 9,
+    borderRadius: 12,
+    backgroundColor: "#F3F1ED",
+    flexDirection: "row",
+    alignItems: "center",
+    overflow: "hidden",
+  },
+  replyComposerLine: {
+    alignSelf: "stretch",
+    width: 4,
+    backgroundColor: "#2C2C2C",
+  },
+  replyComposerThumbnail: {
+    width: 48,
+    height: 48,
+    marginLeft: 8,
+    borderRadius: 8,
+    backgroundColor: "#E5E0D8",
+  },
+  replyComposerVideoThumbnail: {
+    width: 48,
+    height: 48,
+    marginLeft: 8,
+    borderRadius: 8,
+    backgroundColor: "#2C2C2C",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  replyComposerVideoIcon: {
+    color: "#FFFFFF",
+    fontSize: 18,
+    marginLeft: 2,
+  },
+  replyComposerContent: {
+    flex: 1,
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+  },
+  replyComposerTitle: {
+    color: "#2C2C2C",
+    fontSize: 13,
+    fontWeight: "800",
+  },
+  replyComposerText: {
+    marginTop: 3,
+    color: "#666666",
+    fontSize: 13,
+  },
+  cancelReplyButton: {
+    width: 44,
+    height: 44,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 4,
+  },
+  cancelReplyButtonText: {
+    color: "#666666",
+    fontSize: 19,
+    fontWeight: "700",
+  },
+  composerContainer: {
+    backgroundColor: "#FFFFFF",
     paddingHorizontal: 12,
     paddingTop: 10,
     paddingBottom: Platform.OS === "ios" ? 24 : 12,
     flexDirection: "row",
     alignItems: "flex-end",
     gap: 9,
+  },
+  attachmentButton: {
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    backgroundColor: "#F3F1ED",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  attachmentButtonDisabled: {
+    opacity: 0.45,
+  },
+  attachmentButtonText: {
+    color: "#2C2C2C",
+    fontSize: 31,
+    lineHeight: 32,
+    fontWeight: "400",
   },
   composerInput: {
     flex: 1,
@@ -1120,6 +2541,107 @@ const styles = StyleSheet.create({
     fontSize: 21,
     fontWeight: "800",
     marginLeft: 2,
+  },
+  messageActionsBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(0, 0, 0, 0.35)",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 20,
+  },
+  messageActionsCard: {
+    width: "100%",
+    maxWidth: 360,
+    borderRadius: 22,
+    backgroundColor: "#FFFFFF",
+    padding: 12,
+    shadowColor: "#000000",
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.22,
+    shadowRadius: 18,
+    elevation: 10,
+  },
+  quickReactionsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  quickReactionButton: {
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  quickReactionButtonSelected: {
+    backgroundColor: "#EAF7FF",
+    borderWidth: 1,
+    borderColor: "#7BC9F5",
+  },
+  quickReactionEmoji: {
+    fontSize: 25,
+  },
+  messageActionsDivider: {
+    height: 1,
+    marginTop: 10,
+    marginBottom: 4,
+    backgroundColor: "#EEEAE4",
+  },
+  messageActionButton: {
+    minHeight: 50,
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  messageActionIcon: {
+    width: 30,
+    color: "#2C2C2C",
+    fontSize: 23,
+    fontWeight: "700",
+  },
+  messageActionText: {
+    color: "#2C2C2C",
+    fontSize: 16,
+    fontWeight: "700",
+  },
+  fullscreenImageContainer: {
+    flex: 1,
+    backgroundColor: "#000000",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  fullscreenImage: {
+    width: "100%",
+    height: "100%",
+  },
+  fullscreenVideoContainer: {
+    flex: 1,
+    backgroundColor: "#000000",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  fullscreenVideo: {
+    width: "100%",
+    height: "100%",
+  },
+  fullscreenCloseButton: {
+    position: "absolute",
+    top: Platform.OS === "ios" ? 54 : 24,
+    right: 20,
+    zIndex: 2,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: "rgba(255, 255, 255, 0.16)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  fullscreenCloseButtonText: {
+    color: "#FFFFFF",
+    fontSize: 24,
+    lineHeight: 28,
+    fontWeight: "700",
   },
   errorTitle: {
     color: "#2C2C2C",

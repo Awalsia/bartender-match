@@ -52,7 +52,7 @@ async function configureAndroidNotificationChannel(): Promise<void> {
     importance: Notifications.AndroidImportance.MAX,
     vibrationPattern: [0, 250, 250, 250],
     lightColor: "#B00020",
-    sound: "default",
+    //sound: "default",
     enableVibrate: true,
     enableLights: true,
     lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
@@ -152,22 +152,14 @@ export async function registerForPushNotificationsAsync(): Promise<PushRegistrat
     console.log("PUSH: Expo push token generated:", expoPushToken);
     console.log("PUSH: Saving token in Supabase...");
 
-    const { error: upsertError } = await supabase.from("push_tokens").upsert(
-      {
-        user_id: user.id,
-        expo_push_token: expoPushToken,
-        platform: Platform.OS,
-        device_name:
-          Device.deviceName ?? `${Platform.OS} ${Device.modelName ?? "device"}`,
-        app_version:
-          Constants.expoConfig?.version ?? Constants.nativeAppVersion ?? null,
-        is_active: true,
-        last_seen_at: new Date().toISOString(),
-      },
-      {
-        onConflict: "expo_push_token",
-      },
-    );
+    const { error: upsertError } = await supabase.rpc("register_push_token", {
+      p_expo_push_token: expoPushToken,
+      p_platform: Platform.OS,
+      p_device_name:
+        Device.deviceName ?? `${Platform.OS} ${Device.modelName ?? "device"}`,
+      p_app_version:
+        Constants.expoConfig?.version ?? Constants.nativeAppVersion ?? null,
+    });
 
     if (upsertError) {
       console.log("PUSH: Supabase token save error:", upsertError);
@@ -177,6 +169,15 @@ export async function registerForPushNotificationsAsync(): Promise<PushRegistrat
         message: upsertError.message,
       };
     }
+
+    /*   if (upsertError) {
+      console.log("PUSH: Supabase token save error:", upsertError);
+
+      return {
+        status: "registration_failed",
+        message: upsertError.message,
+      };
+    }*/
 
     console.log("PUSH: Token saved successfully in push_tokens.");
 
